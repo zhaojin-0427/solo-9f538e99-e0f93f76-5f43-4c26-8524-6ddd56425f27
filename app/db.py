@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS confirmations (
     action          TEXT NOT NULL CHECK (action IN ('confirm', 'revoke')),
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS batch_results (
+    batch_id        INTEGER PRIMARY KEY REFERENCES batches(id),
+    payload         TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -96,3 +102,22 @@ def row_candidates(row: sqlite3.Row) -> tuple[int, ...]:
 
 def row_feasible(row: sqlite3.Row) -> tuple[int, ...]:
     return tuple(json.loads(row["feasible"]))
+
+
+def save_batch_result(
+    conn: sqlite3.Connection, batch_id: int, payload: dict
+) -> None:
+    """保存某批最近一次批量确认结果（同一批只保留最新一份）。"""
+    conn.execute(
+        "INSERT INTO batch_results (batch_id, payload) VALUES (?, ?) "
+        "ON CONFLICT(batch_id) DO UPDATE SET "
+        "payload = excluded.payload, created_at = datetime('now')",
+        (batch_id, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def load_batch_result(conn: sqlite3.Connection, batch_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT payload FROM batch_results WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    return json.loads(row["payload"]) if row else None

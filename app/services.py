@@ -5,23 +5,42 @@ import csv
 import io
 import json
 import sqlite3
+from dataclasses import dataclass
 
 from . import solver as csp
-from .db import load_entries, load_groups, row_candidates, row_feasible
+from .db import (
+    load_entries,
+    load_groups,
+    row_candidates,
+    row_feasible,
+    save_batch_result,
+)
 from .parsing import ParsedBatch
+
+DEFAULT_NODE_LIMIT = 2_000_000
 
 
 class InfeasibleError(Exception):
     """当前确认状态与两套合计无共同可行解。"""
 
 
-def build_problem(conn: sqlite3.Connection, batch_id: int):
-    """从库里组装求解器输入。
+class StaleBatchError(Exception):
+    """提交所针对的批次已不是当前批次（页面过期）。"""
 
-    已确认金额的笔，候选域收缩为单值（确认值）；未确认笔保留原候选。
-    返回 (domains, memberships, totals, entry_rows)，其中分组 id 布局为
-    前半段窗口分组、后半段售票日分组。
-    """
+
+class AlreadyConfirmedError(Exception):
+    """所勾选的票款在提交时已有确认（页面过期）。"""
+
+
+class SelectionError(ValueError):
+    """勾选内容不合法（重复勾选、金额不在候选中等）。"""
+
+
+class SaveError(Exception):
+    """写入数据库失败，已回滚，原有状态保持不变。"""
+
+
+def _problem_parts(conn: sqlite3.Connection, batch_id: int):
     entry_rows = load_entries(conn, batch_id)
     group_rows = load_groups(conn, batch_id)
 
@@ -47,12 +66,34 @@ def build_problem(conn: sqlite3.Connection, batch_id: int):
     return domains, memberships, totals, entry_rows
 
 
+def build_problem(conn: sqlite3.Connection, batch_id: int):
+    """从库里组装求解器输入。
+
+    已确认金额的笔，候选域收缩为单值（确认值）；未确认笔保留原候选。
+    返回 (domains, memberships, totals, entry_rows)，其中分组 id 布局为
+    前半段窗口分组、后半段售票日分组。
+    """
+    return _problem_parts(conn, batch_id)
+
+
+def _budget(node_limit: int) -> csp.SearchBudget:
+    return csp.SearchBudget(node_limit)
+
 def recompute_feasible(
-    conn: sqlite3.Connection, batch_id: int, *, persist: bool = True
+    conn: sqlite3.Connection,
+    batch_id: int,
+    *,
+    persist: bool = True,
+    budget: csp.SearchBudget | None = None,
 ) -> list[tuple[int, ...]]:
     """按当前确认状态重算每笔可行金额，可选择写回 entries.feasible。"""
     domains, memberships, totals, entry_rows = build_problem(conn, batch_id)
-    feasible = csp.compute_feasible(domains, memberships, totals)
+    feasible = csp.compute_feasible(
+        domains,
+        memberships,
+        totals,
+        budget=budget if budget is not None else _budget(DEFAULT_NODE_LIMIT),
+    )
     if not feasible or any(len(v) == 0 for v in feasible):
         raise InfeasibleError("当前票款候选与两套纸面合计不存在可行解")
     if persist:
@@ -138,6 +179,152 @@ def confirm_entry(
         (batch_id, entry_id, amount),
     )
     conn.commit()
+
+
+@dataclass(frozen=True)
+class BatchSelection:
+    """一笔待批量确认的勾选：entry_id 与所选金额（分）。"""
+
+    entry_id: int
+    amount: int
+
+
+@dataclass(frozen=True)
+class BatchConfirmationResult:
+    """批量确认的结果：采纳/未采纳的票号与本次搜索访问的状态数。"""
+
+    adopted: tuple[tuple[str, int], ...]
+    rejected: tuple[tuple[str, int], ...]
+    search_nodes: int
+
+    @property
+    def adopted_count(self) -> int:
+        return len(self.adopted)
+
+    @property
+    def rejected_count(self) -> int:
+        return len(self.rejected)
+
+
+def confirm_entries(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    selections: list[BatchSelection],
+    *,
+    node_limit: int = DEFAULT_NODE_LIMIT,
+) -> BatchConfirmationResult:
+    """批量确认：一次提交里采纳最多能同时成立的勾选。
+
+    - 只在当前批次上操作；提交时批次已切换则拒绝（StaleBatchError）。
+    - 所选票款在提交时已有确认则拒绝（AlreadyConfirmedError），不做部分采纳。
+    - 采纳方案：先比采纳笔数，笔数相同按清单行序比较，优先采纳第一笔取舍
+      不同的票（即更靠前的票优先采纳）。
+    - 采纳判定与随后的一次全表可行金额重算共用同一搜索预算。
+    - 采纳的确认、确认流水与新的 feasible 在同一事务内保存；任何失败都回滚。
+    - 未采纳的票保持原状，候选金额照旧，供后续校对。
+    """
+    latest = conn.execute("SELECT MAX(id) AS id FROM batches").fetchone()["id"]
+    if latest is None or latest != batch_id:
+        raise StaleBatchError("该批次已不是当前批次，请刷新页面后重试")
+
+    entries = load_entries(conn, batch_id)
+    if not entries:
+        raise InfeasibleError("当前批次没有任何票款记录")
+    by_id = {row["id"]: pos for pos, row in enumerate(entries)}
+
+    # 勾选校验：票款存在、金额在候选中、同一笔不重复、尚未确认
+    chosen: dict[int, int] = {}
+    for sel in selections:
+        pos = by_id.get(sel.entry_id)
+        if pos is None:
+            raise SelectionError("所选票款不存在或不属于当前批次，请刷新页面")
+        if pos in chosen:
+            raise SelectionError("同一笔票款只能勾选一个金额")
+        if entries[pos]["confirmed_amount"] is not None:
+            raise AlreadyConfirmedError(
+                "所选票款已有确认，请刷新页面后重新校对"
+            )
+        if sel.amount not in row_candidates(entries[pos]):
+            raise SelectionError("所选金额不在该笔票款的候选金额中")
+        chosen[pos] = sel.amount
+
+    domains, memberships, totals, entry_rows = _problem_parts(conn, batch_id)
+    budget = _budget(node_limit)
+    picks = sorted(chosen.items())
+    try:
+        adopted, rejected = csp.select_max_adoptions(
+            domains, memberships, totals, picks, budget=budget
+        )
+        if adopted:
+            for pos, amount in adopted:
+                domains[pos] = (amount,)
+        feasible = csp.compute_feasible(
+            domains, memberships, totals, budget=budget
+        )
+    except csp.SearchLimitExceeded as exc:
+        raise csp.SearchLimitExceeded(
+            f"{exc}；本次预算已用尽，未做任何改动，请减少勾选或缩小批次"
+        ) from exc
+    nodes = budget.used
+
+    if not feasible or any(len(v) == 0 for v in feasible):
+        raise InfeasibleError("采纳后与两套纸面合计不存在可行解")
+
+    adopted_labeled = tuple(
+        (entry_rows[pos]["ticket_no"], amount) for pos, amount in adopted
+    )
+    rejected_labeled = tuple(
+        (entry_rows[pos]["ticket_no"], amount) for pos, amount in rejected
+    )
+    try:
+        for pos, amount in adopted:
+            entry_id = entry_rows[pos]["id"]
+            conn.execute(
+                "UPDATE entries SET confirmed_amount = ? WHERE id = ?",
+                (amount, entry_id),
+            )
+            conn.execute(
+                "INSERT INTO confirmations (batch_id, entry_id, amount, action) "
+                "VALUES (?, ?, ?, 'confirm')",
+                (batch_id, entry_id, amount),
+            )
+        for row, vals in zip(entry_rows, feasible):
+            conn.execute(
+                "UPDATE entries SET feasible = ? WHERE id = ?",
+                (json.dumps(list(vals)), row["id"]),
+            )
+        save_batch_result(
+            conn,
+            batch_id,
+            {
+                "adopted": [list(item) for item in adopted_labeled],
+                "rejected": [list(item) for item in rejected_labeled],
+                "search_nodes": nodes,
+            },
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise SaveError(f"保存失败，已保留原状：{exc}") from exc
+
+    return BatchConfirmationResult(
+        adopted=adopted_labeled,
+        rejected=rejected_labeled,
+        search_nodes=nodes,
+    )
+
+
+def count_search_nodes(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    *,
+    node_limit: int = DEFAULT_NODE_LIMIT,
+) -> int:
+    """只读地跑一次全表可行金额搜索，返回访问的状态数（供页面展示）。"""
+    domains, memberships, totals, _ = build_problem(conn, batch_id)
+    budget = _budget(node_limit)
+    csp.compute_feasible(domains, memberships, totals, budget=budget)
+    return budget.used
 
 
 def revoke_entry(conn: sqlite3.Connection, batch_id: int, entry_id: int) -> None:

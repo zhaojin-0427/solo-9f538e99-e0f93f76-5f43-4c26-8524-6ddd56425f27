@@ -218,3 +218,13 @@ def test_non_candidate_value_rejected(app, client):
         follow_redirects=True,
     )
     assert "确认冲突".encode() in resp.data
+
+
+def test_page_offers_batch_submit_and_shows_search_nodes(client):
+    upload_batch(client, ENTRIES, WINDOW_TOTALS, DATE_TOTALS)
+    body = client.get("/").data.decode()
+    # 批量提交表单、按票款命名的勾选控件
+    assert 'action="/batch/confirm"' in body
+    assert "批量确认所选票款" in body
+    assert 'name="amount_' in body
+    assert "本次访问的搜索状态数" in body

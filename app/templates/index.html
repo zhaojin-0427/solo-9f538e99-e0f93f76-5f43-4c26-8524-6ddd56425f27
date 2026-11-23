@@ -36,7 +36,36 @@
     {% else %}
       <span class="tag tag-warn">仍有多可行金额的票款</span>
     {% endif %}
+    <span class="tag tag-node" title="打开本页时全表求解访问的搜索状态数">
+      本次访问的搜索状态数：{{ view.search_nodes if view.search_nodes is not none else '—' }}
+    </span>
   </h2>
+
+  {% if view.last_result %}
+  <div class="batch-result">
+    <p class="small" style="margin:0 0 6px">
+      上次批量提交：采纳 {{ view.last_result.adopted|length }} 笔，
+      未采纳 {{ view.last_result.rejected|length }} 笔；
+      本次搜索访问状态数 <strong>{{ view.last_result.search_nodes }}</strong>。
+    </p>
+    {% if view.last_result.adopted %}
+    <p class="small" style="margin:0 0 4px">
+      已采纳：
+      {% for ticket, amount in view.last_result.adopted %}
+        <span class="chip chip-ok">{{ ticket }} = {{ amount }}</span>
+      {% endfor %}
+    </p>
+    {% endif %}
+    {% if view.last_result.rejected %}
+    <p class="small" style="margin:0">
+      未采纳（请翻纸复查）：
+      {% for ticket, amount in view.last_result.rejected %}
+        <span class="chip chip-rej">{{ ticket }}（勾选 {{ amount }}）</span>
+      {% endfor %}
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
 
   <div class="totals">
     <div>
@@ -64,64 +93,81 @@
 
 <div class="card">
   <h2>逐笔校对
-    <span class="muted small">划线金额为当前确认状态下不可行的候选；确认提交时会与全部已确认金额一起重新校验，冲突则回滚并保留原确认。</span>
+    <span class="muted small">划线金额为当前确认状态下不可行的候选。勾选多笔未确认票的候选金额后可用下方“批量确认所选票款”一次提交；单笔提交仍逐笔即时校验。</span>
   </h2>
-  <table>
-    <thead>
-      <tr>
-        <th>#</th><th>票号</th><th>窗口</th><th>售票日</th>
-        <th>候选金额（分）与可行性</th><th class="num">可行数</th><th>操作</th>
-      </tr>
-    </thead>
-    <tbody>
-    {% for e in view.entries %}
-      <tr>
-        <td>{{ e.position + 1 }}</td>
-        <td>{{ e.ticket_no }}</td>
-        <td>{{ e.window }}</td>
-        <td>{{ e.sale_date }}</td>
-        <td>
-          <form class="inline" method="post"
-                action="{{ url_for('confirm', entry_id=e.id) }}">
-            <input type="hidden" name="ticket_no" value="{{ e.ticket_no }}">
-            {% for v in e.candidates %}
-              {% set is_feasible = v in e.feasible %}
-              {% if is_feasible %}
-              <label class="cand">
-                <input type="radio" name="amount" value="{{ v }}"
-                       {% if e.confirmed == v %}checked{% endif %}>
-                {{ v }}
-              </label>
-              {% else %}
-              <label class="cand disabled" title="当前确认状态下该金额无法满足两套合计">
-                <input type="radio" name="amount" value="{{ v }}" disabled>
-                {{ v }}
-              </label>
+  <form method="post" action="{{ url_for('confirm_batch') }}" id="batch-form">
+    <input type="hidden" name="batch_id" value="{{ view.batch.id }}">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>票号</th><th>窗口</th><th>售票日</th>
+          <th>候选金额（分）与可行性</th><th class="num">可行数</th>
+          <th>单笔</th><th>撤销</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for e in view.entries %}
+        <tr>
+          <td>{{ e.position + 1 }}</td>
+          <td>{{ e.ticket_no }}</td>
+          <td>{{ e.window }}</td>
+          <td>{{ e.sale_date }}</td>
+          <td>
+            <div class="cands">
+              {% for v in e.candidates %}
+                {% set is_feasible = v in e.feasible %}
+                {% if is_feasible %}
+                <label class="cand">
+                  <input type="radio" name="amount_{{ e.id }}" value="{{ v }}"
+                         {% if e.confirmed == v %}checked{% endif %}
+                         {% if e.confirmed is not none %}disabled{% endif %}>
+                  {{ v }}
+                </label>
+                {% else %}
+                <label class="cand disabled" title="当前确认状态下该金额无法满足两套合计">
+                  <input type="radio" name="amount_{{ e.id }}" value="{{ v }}" disabled>
+                  {{ v }}
+                </label>
+                {% endif %}
+              {% endfor %}
+              {% if e.confirmed is not none %}
+                <span class="tag tag-fixed">已确认 {{ e.confirmed }}</span>
               {% endif %}
-            {% endfor %}
-            {% if e.confirmed is not none %}
-              <span class="tag tag-fixed">已确认 {{ e.confirmed }}</span>
+            </div>
+          </td>
+          <td class="num">
+            {{ e.feasible|length }}
+            {% if e.feasible|length == 1 %}<span class="tag tag-ok">唯一</span>{% endif %}
+          </td>
+          <td>
+            {% if e.confirmed is none %}
+            <button type="submit" class="ghost"
+                    formaction="{{ url_for('confirm', entry_id=e.id) }}"
+                    formnovalidate>单笔提交</button>
+            {% else %}
+            <span class="muted small">—</span>
             {% endif %}
-            <button type="submit"
-                    {% if not e.feasible %}disabled{% endif %}>提交确认</button>
-          </form>
-        </td>
-        <td class="num">
-          {{ e.feasible|length }}
-          {% if e.feasible|length == 1 %}<span class="tag tag-ok">唯一</span>{% endif %}
-        </td>
-        <td>
-          {% if e.confirmed is not none %}
-          <form class="inline" method="post"
-                action="{{ url_for('revoke', entry_id=e.id) }}">
-            <button type="submit" class="danger">撤销确认</button>
-          </form>
-          {% else %}<span class="muted small">—</span>{% endif %}
-        </td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+          </td>
+          <td>
+            {% if e.confirmed is not none %}
+            <button type="submit" class="danger"
+                    formaction="{{ url_for('revoke', entry_id=e.id) }}"
+                    formnovalidate>撤销确认</button>
+            {% else %}<span class="muted small">—</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <p class="batch-actions">
+      <button type="submit">批量确认所选票款</button>
+      <span class="small muted">
+        一次提交只重算一次全表：先采纳最多能同时成立的勾选；笔数相同时按清单行序，
+        优先采纳靠前票款的取舍。未采纳的票保留原候选。
+      </span>
+    </p>
+  </form>
 
   <p style="margin-top:16px">
     <a href="{{ url_for('export') }}">

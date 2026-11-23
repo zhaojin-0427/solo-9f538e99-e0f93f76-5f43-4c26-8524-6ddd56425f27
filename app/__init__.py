@@ -15,11 +15,17 @@ from flask import (
 
 from . import db as db_mod
 from . import parsing, services
-from .db import get_db, latest_batch_id, load_batch, load_entries, load_groups
-from .db import row_candidates, row_feasible
+from .db import get_db, latest_batch_id, load_batch, load_batch_result, load_entries
+from .db import load_groups, row_candidates, row_feasible
 from .parsing import ParseError
 from .solver import SearchLimitExceeded, SolverError
-from .services import InfeasibleError
+from .services import (
+    AlreadyConfirmedError,
+    InfeasibleError,
+    SaveError,
+    SelectionError,
+    StaleBatchError,
+)
 
 
 def create_app(database: str | None = None) -> Flask:
@@ -67,11 +73,77 @@ def create_app(database: str | None = None) -> Flask:
             "date_totals": date_totals,
             "all_singletons": services.all_singletons(conn, batch_id),
             "confirmed_count": sum(1 for e in view_entries if e["confirmed"] is not None),
+            "last_result": load_batch_result(conn, batch_id),
         }
 
     @app.get("/")
     def index():
-        return render_template("index.html", view=_current_batch_view())
+        view = _current_batch_view()
+        if view is not None:
+            try:
+                view["search_nodes"] = services.count_search_nodes(
+                    get_db(), view["batch"]["id"]
+                )
+            except (SolverError, InfeasibleError):
+                # 展示用统计不可得时不影响页面其余内容
+                view["search_nodes"] = None
+        return render_template("index.html", view=view)
+
+    @app.post("/batch/confirm")
+    def confirm_batch():
+        """批量提交多笔未确认票的勾选金额，一次重算。"""
+        raw_batch = request.form.get("batch_id", "")
+        try:
+            batch_id = int(raw_batch)
+        except (TypeError, ValueError):
+            flash("提交失败：批次信息缺失，请刷新页面后重试。", "error")
+            return redirect(url_for("index"))
+
+        selections: list[services.BatchSelection] = []
+        invalid: list[str] = []
+        for raw_id, amount in request.form.items(multi=True):
+            if not raw_id.startswith("amount_"):
+                continue
+            try:
+                entry_id = int(raw_id[len("amount_"):])
+                selections.append(services.BatchSelection(entry_id, int(amount)))
+            except (TypeError, ValueError):
+                invalid.append(raw_id)
+        if invalid:
+            flash("提交失败：勾选金额格式不正确，请刷新页面后重试。", "error")
+            return redirect(url_for("index"))
+        if not selections:
+            flash("提交失败：请至少勾选一笔票款的候选金额。", "error")
+            return redirect(url_for("index"))
+
+        conn = get_db()
+        try:
+            result = services.confirm_entries(conn, batch_id, selections)
+        except StaleBatchError:
+            flash("提交失败：批次已切换，请刷新页面后重新校对。", "error")
+            return redirect(url_for("index"))
+        except AlreadyConfirmedError as exc:
+            flash(f"提交失败：{exc}", "error")
+            return redirect(url_for("index"))
+        except SearchLimitExceeded as exc:
+            flash(f"提交失败：{exc}。已保留原状，请减少勾选或缩小批次。", "error")
+            return redirect(url_for("index"))
+        except SaveError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("index"))
+        except (SelectionError, InfeasibleError, SolverError) as exc:
+            flash(f"提交失败，已保留原状：{exc}", "error")
+            return redirect(url_for("index"))
+
+        if result.rejected:
+            flash(
+                f"已采纳 {result.adopted_count} 笔确认，"
+                f"{result.rejected_count} 笔未能同时成立，已保留原候选。",
+                "ok",
+            )
+        else:
+            flash(f"已采纳全部 {result.adopted_count} 笔勾选并重算可行金额。", "ok")
+        return redirect(url_for("index"))
 
     @app.post("/upload")
     def upload():
@@ -101,7 +173,7 @@ def create_app(database: str | None = None) -> Flask:
 
     @app.post("/entries/<int:entry_id>/confirm")
     def confirm(entry_id: int):
-        raw = request.form.get("amount", "")
+        raw = request.form.get(f"amount_{entry_id}", request.form.get("amount", ""))
         try:
             amount = int(raw)
         except (TypeError, ValueError):
@@ -117,7 +189,13 @@ def create_app(database: str | None = None) -> Flask:
         except (InfeasibleError, SolverError, SearchLimitExceeded) as exc:
             flash(f"确认冲突，已保留原有确认记录：{exc}", "error")
             return redirect(url_for("index"))
-        flash(f"票款 {request.form.get('ticket_no', '')} 已确认 {amount} 分，剩余候选已更新。", "ok")
+        ticket_no = request.form.get("ticket_no", "")
+        if not ticket_no:
+            row = conn.execute(
+                "SELECT ticket_no FROM entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+            ticket_no = row["ticket_no"] if row else ""
+        flash(f"票款 {ticket_no} 已确认 {amount} 分，剩余候选已更新。", "ok")
         return redirect(url_for("index"))
 
     @app.post("/entries/<int:entry_id>/revoke")
